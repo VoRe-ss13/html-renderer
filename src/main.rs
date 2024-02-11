@@ -1,67 +1,52 @@
+use axum::{
+    extract::{Query, State},
+    routing::post,
+    Router,
+};
+pub mod configuration;
+pub mod render;
 
-use std::io::Cursor;
-use image::io::Reader as ImageReader;
-use fantoccini::ClientBuilder;
+use serenity::prelude::*;
+use serenity::builder::{CreateAttachment, CreateMessage};
+use serenity::model::id::ChannelId;
+use std::collections::HashMap;
+use std::error::Error;
+use render::get_screenshot;
+use configuration::Configuration;
 
 #[tokio::main]
-async fn main() -> Result<(), fantoccini::error::CmdError> {
-    let mut capabilities = serde_json::map::Map::new();
-    let options = serde_json::json!({ "args": ["--headless","--width=1024","--height=4096"] });
-    capabilities.insert("moz:firefoxOptions".to_string(), options.clone());
-    let c = ClientBuilder::native().capabilities(capabilities).connect("http://localhost:4444").await.expect("failed to connect to WebDriver");
+async fn main() -> Result<(), Box<dyn Error>> {
+    let settings = configuration::read_config()?;
+    /*let data = fs::read_to_string("test.html")?;
+    let bytes = get_screenshot(data).await?;*/
+    let app = Router::new()
+        .route("/", post(submit))
+        // provide the state so the router can access it
+        .with_state(settings.clone());
 
-    // first, go to the Wikipedia page for Foobar
-    c.goto("https://en.wikipedia.org/wiki/Foobar").await?;
-    let png_data = c.screenshot().await?;
+    let bindaddr = format!("0.0.0.0:{}",settings.port);
+    
+    let listener = tokio::net::TcpListener::bind(&bindaddr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
 
-    let img = ImageReader::new(Cursor::new(png_data)).with_guessed_format().unwrap().decode().unwrap().into_rgba8();
-    autocrop_and_save(img, "out3.png");
-    c.close().await?;
     return Ok(());
 }
 
-fn autocrop_and_save(img: image::RgbaImage, filename: &str){
-    let dimensions = img.dimensions();
-    println!("{},{}",dimensions.0,dimensions.1);
-    let mut left = dimensions.0;
-    let mut right = 0;
-    let mut top = dimensions.1;
-    let mut bottom = 0;
-    let mut tl_color: Option<image::Rgba<u8>> = None;
-    let mut br_color: Option<image::Rgba<u8>> = None;
-    for (x, y, pixel) in img.enumerate_pixels() {
-        if let Some(pix) = tl_color {
-            if pix != *pixel{
-                if x < left {
-                    left = x;
-                }
-                if y < top {
-                    top = y;
-                }
-            }
-        } else {
-            tl_color = Some(pixel.clone());
-        }
-    }
-    //Pain, no double ended iterator :(
-    for x in (0..dimensions.0).rev() {
-        for y in (0..dimensions.1).rev() {
-            let pixel = img.get_pixel(x,y);
-            if let Some(pix) = br_color {
-                if pix != *pixel{
-                    if x > right {
-                        right = x;
-                    }
-                    if y > bottom {
-                        bottom = y;
-                    }
-                }
-            } else {
-                br_color = Some(pixel.clone());
-            }
-        }
-    }
-    let imgout = image::imageops::crop_imm(&img,left,top,right,bottom).to_image();
-    println!("tl:{:?},br:{:?},top:{:?},bottom:{:?},left:{:?},right:{:?}",tl_color,br_color,top,bottom,left,right);
-    imgout.save(filename).unwrap();
+async fn submit(Query(params): Query<HashMap<String, String>>, State(state): State<Configuration>, body: String ) {
+    let image = get_screenshot(body).await.unwrap();
+    //params.get
+    let token = state.discord_token;
+    let intents = GatewayIntents::non_privileged() | GatewayIntents::MESSAGE_CONTENT;
+    let client = Client::builder(token, intents).await.unwrap();
+    let cid = ChannelId::from(state.discord_channel);
+    let ckey = match params.get("ckey") {
+        Some(x) => x.clone(),
+        None => "Unknown".to_string()
+    };
+    let name = match params.get("name") {
+        Some(x) => x.clone(),
+        None => "Unknown".to_string()
+    };
+    cid.send_message(client.http,CreateMessage::new().content(format!("Fax from {}/({})",name,ckey)).add_file(CreateAttachment::bytes(image,"fax.png"))).await.unwrap();
+    //client.http.send_message()
 }
